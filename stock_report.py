@@ -7,6 +7,8 @@ import html
 import math
 import os
 import shutil
+import sys
+import traceback
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +49,49 @@ PE_DISPLAY_COLUMNS = [
     "90D Value Range", "90D Normal Value", "180D PE Range", "180D PE Std", "180D PE Z",
     "180D Value Range", "180D Normal Value", "Status",
 ]
+
+
+class RunLogger:
+    def __init__(self, verbose: bool = True) -> None:
+        self.verbose = verbose
+        self.started_at = datetime.now()
+        self.errors: list[tuple[str, str]] = []
+
+    def _emit(self, level: str, msg: str) -> None:
+        if self.verbose or level in {"ERROR", "WARN"}:
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] [{level:<5}] {msg}", flush=True)
+
+    def step(self, msg: str) -> None:
+        self._emit("STEP", msg)
+
+    def info(self, msg: str) -> None:
+        self._emit("INFO", msg)
+
+    def warn(self, msg: str) -> None:
+        self._emit("WARN", msg)
+
+    def error(self, context: str, exc: Exception | str) -> None:
+        text = str(exc)
+        self.errors.append((context, text))
+        self._emit("ERROR", f"{context}: {text}")
+
+    def summary(self) -> None:
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        print("\n" + "=" * 72)
+        print("Run Summary")
+        print("=" * 72)
+        print(f"Elapsed: {elapsed:.1f}s")
+        if not self.errors:
+            print("Errors: 0")
+        else:
+            print(f"Errors: {len(self.errors)}")
+            for i, (ctx, text) in enumerate(self.errors, start=1):
+                print(f"  {i}. {ctx}: {text}")
+        print("=" * 72)
+
+
+LOGGER = RunLogger(verbose=True)
 
 
 def safe_float(v: Any) -> float | None:
@@ -95,11 +140,21 @@ def dedupe_keep_order(items: list[str]) -> list[str]:
     return result
 
 
+def normalize_date_series(series: pd.Series) -> pd.Series:
+    """Return timezone-free pandas datetime64[ns] normalized to date midnight."""
+    parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    parsed = parsed.dt.tz_convert(None).dt.normalize()
+    return parsed.astype("datetime64[ns]")
+
+
 def parse_dt(value: Any) -> pd.Timestamp | None:
-    dt = pd.to_datetime(value, errors="coerce", utc=True)
-    if pd.isna(dt):
+    try:
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            return None
+        return pd.Timestamp(parsed.tz_convert(None).normalize())
+    except Exception:
         return None
-    return dt.tz_convert(None).normalize()
 
 
 def get_last_price(ticker: yf.Ticker, info: dict[str, Any]) -> float | None:
@@ -123,25 +178,33 @@ def get_last_price(ticker: yf.Ticker, info: dict[str, Any]) -> float | None:
 
 
 def get_ten_year_yield() -> float | None:
+    LOGGER.step("Fetching 10Y Treasury yield from ^TNX")
     try:
         h = yf.Ticker("^TNX").history(period="10d", auto_adjust=False)
         raw = safe_float(h["Close"].dropna().iloc[-1]) if not h.empty else None
         if raw is None:
+            LOGGER.warn("10Y Treasury yield unavailable")
             return None
         if raw > 20:
-            return raw / 1000.0
-        if raw > 1:
-            return raw / 100.0
-        return raw
-    except Exception:
+            y = raw / 1000.0
+        elif raw > 1:
+            y = raw / 100.0
+        else:
+            y = raw
+        LOGGER.info(f"10Y Treasury yield: {fmt_pct(y)}")
+        return y
+    except Exception as e:
+        LOGGER.error("Fetch 10Y Treasury yield", e)
         return None
 
 
 def collect_one_stock(symbol: str, ten_year_yield: float | None) -> dict[str, Any]:
+    LOGGER.step(f"Fetching current valuation snapshot for {symbol}")
     t = yf.Ticker(symbol)
     try:
         info = t.info or {}
-    except Exception:
+    except Exception as e:
+        LOGGER.error(f"{symbol} yfinance info", e)
         info = {}
     price = get_last_price(t, info)
     trailing_eps = safe_float(info.get("trailingEps"))
@@ -159,6 +222,7 @@ def collect_one_stock(symbol: str, ten_year_yield: float | None) -> dict[str, An
     ep = trailing_eps / price if price and trailing_eps and price > 0 else (1 / ttm_pe if ttm_pe and ttm_pe > 0 else None)
     forward_ep = forward_eps / price if price and forward_eps and price > 0 else (1 / forward_pe if forward_pe and forward_pe > 0 else None)
     erp = forward_ep - ten_year_yield if forward_ep is not None and ten_year_yield is not None else None
+    LOGGER.info(f"{symbol}: price={fmt_money(price)}, TTM EPS={fmt_num(trailing_eps)}, TTM PE={fmt_num(ttm_pe)}, Forward PE={fmt_num(forward_pe)}")
     return {
         "Ticker": symbol,
         "Company": info.get("shortName") or info.get("longName") or "N/A",
@@ -178,12 +242,14 @@ def collect_one_stock(symbol: str, ten_year_yield: float | None) -> dict[str, An
 
 
 def build_report(tickers: list[str]) -> pd.DataFrame:
+    LOGGER.step(f"Building main valuation report for {len(tickers)} ticker(s): {', '.join(tickers)}")
     ten_year_yield = get_ten_year_yield()
     rows = []
     for symbol in tickers:
         try:
             rows.append(collect_one_stock(symbol, ten_year_yield))
         except Exception as e:
+            LOGGER.error(f"Build main snapshot for {symbol}", e)
             row = {col: None for col in RAW_COLUMNS}
             row.update({"Ticker": symbol, "Company": f"ERROR: {e}", "10Y Yield": ten_year_yield})
             rows.append(row)
@@ -206,8 +272,12 @@ def sec_user_agent() -> str:
 def sec_get_json(url: str) -> Any | None:
     try:
         r = requests.get(url, headers={"User-Agent": sec_user_agent(), "Accept-Encoding": "gzip, deflate"}, timeout=20)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
+        if r.status_code != 200:
+            LOGGER.warn(f"SEC request failed HTTP {r.status_code}: {url}")
+            return None
+        return r.json()
+    except Exception as e:
+        LOGGER.error(f"SEC request {url}", e)
         return None
 
 
@@ -248,19 +318,24 @@ def fiscal_order(fy: int, quarter: str) -> int:
 
 
 def get_sec_ttm_eps_history(symbol: str) -> pd.DataFrame:
+    LOGGER.step(f"{symbol}: attempting SEC point-in-time EPS history")
     cik = sec_ticker_to_cik(symbol)
     if cik is None:
+        LOGGER.warn(f"{symbol}: SEC CIK not found")
         return pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
     facts = sec_get_json(SEC_COMPANY_FACTS_URL.format(cik=cik))
     us_gaap = ((facts or {}).get("facts") or {}).get("us-gaap") or {}
     records = None
+    used_tag = None
     for tag in SEC_EPS_TAGS:
         obj = us_gaap.get(tag)
         if obj:
             records = choose_sec_eps_unit(obj.get("units") or {})
             if records:
+                used_tag = tag
                 break
     if not records:
+        LOGGER.warn(f"{symbol}: SEC EPS tag not available")
         return pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
 
     quarters: dict[tuple[int, str], dict[str, Any]] = {}
@@ -289,59 +364,81 @@ def get_sec_ttm_eps_history(symbol: str) -> pd.DataFrame:
     for fy, annual in annuals.items():
         vals = [quarters.get((fy, q), {}).get("EPS") for q in ["Q1", "Q2", "Q3"]]
         if all(v is not None for v in vals) and (fy, "Q4") not in quarters:
-            quarters[(fy, "Q4")] = {"FY": fy, "Quarter": "Q4", "Filed": annual["Filed"], "EPS": annual["Annual EPS"] - sum(vals), "Fiscal Order": fiscal_order(fy, "Q4")}
+            quarters[(fy, "Q4")] = {
+                "FY": fy, "Quarter": "Q4", "Filed": annual["Filed"],
+                "EPS": annual["Annual EPS"] - sum(vals), "Fiscal Order": fiscal_order(fy, "Q4")
+            }
 
     if not quarters:
+        LOGGER.warn(f"{symbol}: SEC EPS records found but no usable quarterly EPS")
         return pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
     qdf = pd.DataFrame(list(quarters.values())).sort_values(["Filed", "Fiscal Order"])
     rows = []
     for report_date in sorted(qdf["Filed"].dropna().unique()):
-        available = qdf[qdf["Filed"] <= report_date].sort_values("Fiscal Order")
+        report_ts = pd.Timestamp(report_date).normalize()
+        available = qdf[qdf["Filed"] <= report_ts].sort_values("Fiscal Order")
         latest_four = available.tail(4)
         if len(latest_four) >= 4:
             rows.append({
-                "Report Date": pd.Timestamp(report_date).normalize(),
+                "Report Date": report_ts,
                 "Point-in-Time TTM EPS": safe_float(latest_four["EPS"].sum()),
                 "EPS Reports Used": int(len(available)),
-                "EPS Source": "SEC Company Facts",
+                "EPS Source": f"SEC Company Facts {used_tag}",
             })
-    return pd.DataFrame(rows).dropna(subset=["Point-in-Time TTM EPS"]).drop_duplicates("Report Date", keep="last").sort_values("Report Date") if rows else pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
+    if not rows:
+        LOGGER.warn(f"{symbol}: SEC did not produce enough quarters for TTM EPS")
+        return pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
+    out = pd.DataFrame(rows).dropna(subset=["Point-in-Time TTM EPS"]).drop_duplicates("Report Date", keep="last").sort_values("Report Date")
+    out["Report Date"] = normalize_date_series(out["Report Date"])
+    LOGGER.info(f"{symbol}: SEC EPS history rows={len(out)}")
+    return out
 
 
-def get_yfinance_ttm_eps_history(ticker: yf.Ticker) -> pd.DataFrame:
+def get_yfinance_ttm_eps_history(ticker: yf.Ticker, symbol: str) -> pd.DataFrame:
+    LOGGER.step(f"{symbol}: attempting Yahoo earnings-date EPS history")
     try:
         earnings = ticker.get_earnings_dates(limit=32)
-    except Exception:
+    except Exception as e:
+        LOGGER.error(f"{symbol} Yahoo earnings dates", e)
         earnings = None
     if earnings is None or earnings.empty:
+        LOGGER.warn(f"{symbol}: Yahoo earnings dates unavailable")
         return pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
     df = earnings.reset_index()
     eps_col = next((c for c in df.columns if "eps actual" in str(c).lower() or "reported eps" in str(c).lower()), None)
     if eps_col is None:
+        LOGGER.warn(f"{symbol}: Yahoo earnings dates missing actual EPS column")
         return pd.DataFrame(columns=["Report Date", "Point-in-Time TTM EPS"])
     out = pd.DataFrame({
-        "Report Date": pd.to_datetime(df[df.columns[0]], errors="coerce", utc=True).dt.tz_convert(None).dt.normalize(),
+        "Report Date": normalize_date_series(df[df.columns[0]]),
         "Quarterly EPS": pd.to_numeric(df[eps_col], errors="coerce"),
     }).dropna().sort_values("Report Date").drop_duplicates("Report Date", keep="last")
     out["Point-in-Time TTM EPS"] = out["Quarterly EPS"].rolling(4).sum()
     out = out.dropna(subset=["Point-in-Time TTM EPS"])
     out["EPS Reports Used"] = range(4, 4 + len(out))
     out["EPS Source"] = "Yahoo earnings dates"
+    LOGGER.info(f"{symbol}: Yahoo EPS history rows={len(out)}")
     return out[["Report Date", "Point-in-Time TTM EPS", "EPS Reports Used", "EPS Source"]]
 
 
-def get_price_history_for_pe(ticker: yf.Ticker) -> pd.DataFrame:
+def get_price_history_for_pe(ticker: yf.Ticker, symbol: str) -> pd.DataFrame:
+    LOGGER.step(f"{symbol}: fetching 1-year daily close prices")
     try:
         hist = ticker.history(period="1y", auto_adjust=False)
-    except Exception:
+    except Exception as e:
+        LOGGER.error(f"{symbol} price history", e)
         hist = pd.DataFrame()
     if hist.empty or "Close" not in hist.columns:
+        LOGGER.warn(f"{symbol}: no historical close price data")
         return pd.DataFrame(columns=["Date", "Close"])
     out = hist.reset_index()
     date_col = "Date" if "Date" in out.columns else out.columns[0]
-    out["Date"] = pd.to_datetime(out[date_col], errors="coerce", utc=True).dt.tz_convert(None).dt.normalize()
+    out["Date"] = normalize_date_series(out[date_col])
     out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
-    return out.dropna(subset=["Date", "Close"]).sort_values("Date")[["Date", "Close"]]
+    out = out.dropna(subset=["Date", "Close"]).sort_values("Date")[["Date", "Close"]]
+    out["Date"] = normalize_date_series(out["Date"])
+    LOGGER.info(f"{symbol}: price history rows={len(out)}, date dtype={out['Date'].dtype}")
+    return out
 
 
 def empty_pe_analysis_row(symbol: str, company: str, status: str) -> dict[str, Any]:
@@ -350,40 +447,69 @@ def empty_pe_analysis_row(symbol: str, company: str, status: str) -> dict[str, A
     return row
 
 
-def merge_prices_with_eps(price_df: pd.DataFrame, eps_df: pd.DataFrame) -> pd.DataFrame:
-    merged = pd.merge_asof(
-        price_df.sort_values("Date"),
-        eps_df[["Report Date", "Point-in-Time TTM EPS"]].sort_values("Report Date"),
-        left_on="Date", right_on="Report Date", direction="backward",
-    ).dropna(subset=["Close", "Point-in-Time TTM EPS"])
+def merge_prices_with_eps(price_df: pd.DataFrame, eps_df: pd.DataFrame, symbol: str, method_name: str) -> pd.DataFrame:
+    if price_df.empty or eps_df.empty:
+        return pd.DataFrame(columns=["Date", "Close", "Historical PE"])
+    p = price_df.copy()
+    e = eps_df.copy()
+    p["Date"] = normalize_date_series(p["Date"])
+    e["Report Date"] = normalize_date_series(e["Report Date"])
+    p = p.sort_values("Date")
+    e = e.sort_values("Report Date")
+    LOGGER.info(f"{symbol}: merge {method_name}: price Date dtype={p['Date'].dtype}, EPS Report Date dtype={e['Report Date'].dtype}, price rows={len(p)}, EPS rows={len(e)}")
+    try:
+        merged = pd.merge_asof(
+            p,
+            e[["Report Date", "Point-in-Time TTM EPS"]],
+            left_on="Date",
+            right_on="Report Date",
+            direction="backward",
+        )
+    except Exception as e_merge:
+        LOGGER.error(f"{symbol} merge_asof {method_name}", e_merge)
+        return pd.DataFrame(columns=["Date", "Close", "Historical PE"])
+    merged = merged.dropna(subset=["Close", "Point-in-Time TTM EPS"])
     merged = merged[merged["Point-in-Time TTM EPS"] > 0]
     if merged.empty:
+        LOGGER.warn(f"{symbol}: merge {method_name} produced no rows with positive TTM EPS")
         return pd.DataFrame(columns=["Date", "Close", "Historical PE"])
     merged["Historical PE"] = merged["Close"] / merged["Point-in-Time TTM EPS"]
-    return merged.replace([math.inf, -math.inf], pd.NA).dropna(subset=["Historical PE"])
+    merged = merged.replace([math.inf, -math.inf], pd.NA).dropna(subset=["Historical PE"])
+    LOGGER.info(f"{symbol}: merge {method_name} produced PE rows={len(merged)}")
+    return merged
 
 
 def count_recent(pe_df: pd.DataFrame, as_of_ts: pd.Timestamp, window: int = 180) -> int:
-    return 0 if pe_df.empty else int(len(pe_df[(pe_df["Date"] >= as_of_ts - pd.Timedelta(days=window)) & (pe_df["Historical PE"] > 0)]))
+    if pe_df.empty:
+        return 0
+    return int(len(pe_df[(pe_df["Date"] >= as_of_ts - pd.Timedelta(days=window)) & (pe_df["Historical PE"] > 0)]))
 
 
 def build_historical_pe_dataset(symbol: str, price_df: pd.DataFrame, ticker: yf.Ticker, current_ttm_eps: float, as_of_ts: pd.Timestamp) -> tuple[pd.DataFrame, str, str, int]:
     sec_eps = get_sec_ttm_eps_history(symbol)
     if not sec_eps.empty:
-        sec_pe = merge_prices_with_eps(price_df, sec_eps)
-        if count_recent(sec_pe, as_of_ts) >= MIN_PE_OBSERVATIONS:
+        sec_pe = merge_prices_with_eps(price_df, sec_eps, symbol, "SEC point-in-time")
+        recent_count = count_recent(sec_pe, as_of_ts)
+        LOGGER.info(f"{symbol}: SEC recent PE observations={recent_count}")
+        if recent_count >= MIN_PE_OBSERVATIONS:
             used = int(safe_float(sec_eps.get("EPS Reports Used", pd.Series([len(sec_eps)])).dropna().iloc[-1]) or len(sec_eps))
             return sec_pe, "SEC point-in-time", "High", used
-    yahoo_eps = get_yfinance_ttm_eps_history(ticker)
+
+    yahoo_eps = get_yfinance_ttm_eps_history(ticker, symbol)
     if not yahoo_eps.empty:
-        yahoo_pe = merge_prices_with_eps(price_df, yahoo_eps)
-        if count_recent(yahoo_pe, as_of_ts) >= MIN_PE_OBSERVATIONS:
+        yahoo_pe = merge_prices_with_eps(price_df, yahoo_eps, symbol, "Yahoo point-in-time")
+        recent_count = count_recent(yahoo_pe, as_of_ts)
+        LOGGER.info(f"{symbol}: Yahoo recent PE observations={recent_count}")
+        if recent_count >= MIN_PE_OBSERVATIONS:
             used = int(safe_float(yahoo_eps.get("EPS Reports Used", pd.Series([len(yahoo_eps)])).dropna().iloc[-1]) or len(yahoo_eps))
             return yahoo_pe, "Yahoo point-in-time", "Medium", used
+
+    LOGGER.warn(f"{symbol}: point-in-time EPS unavailable or insufficient; using Current EPS fallback")
     fallback = price_df.copy()
     fallback["Point-in-Time TTM EPS"] = current_ttm_eps
     fallback["Historical PE"] = fallback["Close"] / current_ttm_eps
-    return fallback.replace([math.inf, -math.inf], pd.NA).dropna(subset=["Historical PE"]), "Current EPS fallback", "Low", 0
+    fallback = fallback.replace([math.inf, -math.inf], pd.NA).dropna(subset=["Historical PE"])
+    return fallback, "Current EPS fallback", "Low", 0
 
 
 def add_window_stats(row: dict[str, Any], window: int, pe_series: pd.Series, current_pe: float | None, current_ttm_eps: float | None) -> None:
@@ -394,7 +520,10 @@ def add_window_stats(row: dict[str, Any], window: int, pe_series: pd.Series, cur
     row[f"{pfx}_Count"] = count
     if count < MIN_PE_OBSERVATIONS:
         return
-    vals = {"Min": pe.min(), "Max": pe.max(), "Mean": pe.mean(), "Median": pe.median(), "Std": pe.std(ddof=1), "P10": pe.quantile(0.10), "P90": pe.quantile(0.90)}
+    vals = {
+        "Min": pe.min(), "Max": pe.max(), "Mean": pe.mean(), "Median": pe.median(),
+        "Std": pe.std(ddof=1), "P10": pe.quantile(0.10), "P90": pe.quantile(0.90),
+    }
     for k, v in vals.items():
         row[f"{pfx}_{k}"] = safe_float(v)
     if current_pe is not None and vals["Std"] and vals["Std"] > 0:
@@ -409,8 +538,11 @@ def add_window_stats(row: dict[str, Any], window: int, pe_series: pd.Series, cur
 
 
 def collect_one_pe_analysis(symbol: str, base_row: pd.Series, as_of_date: str) -> dict[str, Any]:
+    LOGGER.step(f"{symbol}: building PE volatility analysis")
     row = empty_pe_analysis_row(symbol, str(base_row.get("Company", "N/A")), "OK")
-    current_price, current_ttm_eps, current_pe = safe_float(base_row.get("Price")), safe_float(base_row.get("TTM EPS")), safe_float(base_row.get("TTM PE"))
+    current_price = safe_float(base_row.get("Price"))
+    current_ttm_eps = safe_float(base_row.get("TTM EPS"))
+    current_pe = safe_float(base_row.get("TTM PE"))
     if current_ttm_eps is None and current_price and current_pe and current_pe > 0:
         current_ttm_eps = current_price / current_pe
     if current_pe is None and current_price and current_ttm_eps and current_ttm_eps > 0:
@@ -418,31 +550,43 @@ def collect_one_pe_analysis(symbol: str, base_row: pd.Series, as_of_date: str) -
     row.update({"Current Price": current_price, "Current TTM EPS": current_ttm_eps, "Current TTM PE": current_pe})
     if current_ttm_eps is None or current_ttm_eps <= 0:
         row["Status"] = "No positive current TTM EPS; PE analysis skipped"
+        LOGGER.warn(f"{symbol}: {row['Status']}")
         return row
     if current_pe is None or current_pe <= 0:
         row["Status"] = "No positive current PE; PE analysis skipped"
+        LOGGER.warn(f"{symbol}: {row['Status']}")
         return row
     ticker = yf.Ticker(symbol)
-    price_df = get_price_history_for_pe(ticker)
+    price_df = get_price_history_for_pe(ticker, symbol)
     if price_df.empty:
         row["Status"] = "No historical close price data from yfinance"
+        LOGGER.warn(f"{symbol}: {row['Status']}")
         return row
     as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
     as_of_ts = pd.Timestamp.today().normalize() if pd.isna(as_of_ts) else pd.Timestamp(as_of_ts).normalize()
     pe_df, method, quality, used = build_historical_pe_dataset(symbol, price_df, ticker, current_ttm_eps, as_of_ts)
-    row.update({"Method": method, "Data Quality": quality, "Historical EPS Reports Used": used, "Status": "OK" if method != "Current EPS fallback" else "OK - fallback used"})
+    row.update({
+        "Method": method,
+        "Data Quality": quality,
+        "Historical EPS Reports Used": used,
+        "Status": "OK" if method != "Current EPS fallback" else "OK - fallback used",
+    })
     if pe_df.empty:
         row["Status"] = "No usable PE observations"
+        LOGGER.warn(f"{symbol}: {row['Status']}")
         return row
     for w in PE_WINDOWS:
         window_df = pe_df[pe_df["Date"] >= as_of_ts - pd.Timedelta(days=w)]
         add_window_stats(row, w, window_df["Historical PE"], current_pe, current_ttm_eps)
+        LOGGER.info(f"{symbol}: {w}D PE observations={row.get(f'PE_{w}D_Count')}, PE range={fmt_range(row.get(f'PE_{w}D_Min'), row.get(f'PE_{w}D_Max'))}")
     if max([safe_float(row.get(f"PE_{w}D_Count")) or 0 for w in PE_WINDOWS]) < MIN_PE_OBSERVATIONS:
         row["Status"] = "Not enough PE observations in requested windows"
+        LOGGER.warn(f"{symbol}: {row['Status']}")
     return row
 
 
 def build_pe_analysis(raw_df: pd.DataFrame, as_of_date: str) -> pd.DataFrame:
+    LOGGER.step("Building PE volatility table")
     rows = []
     for _, base_row in raw_df.iterrows():
         symbol = str(base_row.get("Ticker", "")).upper().strip()
@@ -451,6 +595,9 @@ def build_pe_analysis(raw_df: pd.DataFrame, as_of_date: str) -> pd.DataFrame:
         try:
             rows.append(collect_one_pe_analysis(symbol, base_row, as_of_date))
         except Exception as e:
+            LOGGER.error(f"PE analysis for {symbol}", e)
+            if LOGGER.verbose:
+                traceback.print_exc()
             rows.append(empty_pe_analysis_row(symbol, str(base_row.get("Company", "N/A")), f"ERROR: {e}"))
     return pd.DataFrame(rows).reindex(columns=PE_ANALYSIS_RAW_COLUMNS) if rows else pd.DataFrame(columns=PE_ANALYSIS_RAW_COLUMNS)
 
@@ -508,9 +655,11 @@ def pe_html_cell(column: str, display_value: str, raw_row: pd.Series) -> str:
         cls = "good" if display_value == "OK" else ("okay" if "fallback" in display_value.lower() else "bad")
         return f'<td><span class="pill {cls}">{html.escape(display_value)}</span></td>'
     if column == "90D PE Z":
-        return f'<td><span class="pill {zscore_class(safe_float(raw_row.get("PE_90D_Current_ZScore")))}">{html.escape(display_value)}</span></td>'
+        cls = zscore_class(safe_float(raw_row.get("PE_90D_Current_ZScore")))
+        return f'<td><span class="pill {cls}">{html.escape(display_value)}</span></td>'
     if column == "180D PE Z":
-        return f'<td><span class="pill {zscore_class(safe_float(raw_row.get("PE_180D_Current_ZScore")))}">{html.escape(display_value)}</span></td>'
+        cls = zscore_class(safe_float(raw_row.get("PE_180D_Current_ZScore")))
+        return f'<td><span class="pill {cls}">{html.escape(display_value)}</span></td>'
     return f'<td>{html.escape(display_value)}</td>'
 
 
@@ -553,41 +702,62 @@ def merge_and_dedupe_history(today_df: pd.DataFrame, history_path: Path, columns
 
 
 def save_history(raw_df: pd.DataFrame, as_of_date: str, generated_at: str, data_dir: str, export_excel: bool = True) -> tuple[Path, Path | None]:
+    LOGGER.step("Saving main valuation history")
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     csv_path, xlsx_path = Path(data_dir) / "valuation_history.csv", Path(data_dir) / "valuation_history.xlsx"
-    today = raw_df.copy(); today.insert(0, "Generated At", generated_at); today.insert(0, "Date", as_of_date); today = today.reindex(columns=HISTORY_COLUMNS)
-    combined = merge_and_dedupe_history(today, csv_path, HISTORY_COLUMNS); combined.to_csv(csv_path, index=False)
+    today = raw_df.copy()
+    today.insert(0, "Generated At", generated_at)
+    today.insert(0, "Date", as_of_date)
+    today = today.reindex(columns=HISTORY_COLUMNS)
+    combined = merge_and_dedupe_history(today, csv_path, HISTORY_COLUMNS)
+    combined.to_csv(csv_path, index=False)
     if not export_excel:
         return csv_path, None
     try:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            combined.to_excel(writer, sheet_name="History", index=False); today.to_excel(writer, sheet_name="Latest", index=False)
+            combined.to_excel(writer, sheet_name="History", index=False)
+            today.to_excel(writer, sheet_name="Latest", index=False)
         return csv_path, xlsx_path
     except Exception as e:
-        print(f"Warning: Excel export failed. CSV history was still saved. Error: {e}"); return csv_path, None
+        LOGGER.error("Main Excel export", e)
+        return csv_path, None
 
 
 def save_pe_history(pe_raw_df: pd.DataFrame, as_of_date: str, generated_at: str, data_dir: str, export_excel: bool = True) -> tuple[Path, Path | None]:
+    LOGGER.step("Saving PE valuation history")
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     csv_path, xlsx_path = Path(data_dir) / "pe_valuation_history.csv", Path(data_dir) / "pe_valuation_history.xlsx"
-    today = pe_raw_df.copy(); today.insert(0, "Generated At", generated_at); today.insert(0, "Date", as_of_date); today = today.reindex(columns=PE_ANALYSIS_HISTORY_COLUMNS)
-    combined = merge_and_dedupe_history(today, csv_path, PE_ANALYSIS_HISTORY_COLUMNS); combined.to_csv(csv_path, index=False)
+    today = pe_raw_df.copy()
+    today.insert(0, "Generated At", generated_at)
+    today.insert(0, "Date", as_of_date)
+    today = today.reindex(columns=PE_ANALYSIS_HISTORY_COLUMNS)
+    combined = merge_and_dedupe_history(today, csv_path, PE_ANALYSIS_HISTORY_COLUMNS)
+    combined.to_csv(csv_path, index=False)
     if not export_excel:
         return csv_path, None
     try:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            combined.to_excel(writer, sheet_name="History", index=False); today.to_excel(writer, sheet_name="Latest", index=False)
+            combined.to_excel(writer, sheet_name="History", index=False)
+            today.to_excel(writer, sheet_name="Latest", index=False)
         return csv_path, xlsx_path
     except Exception as e:
-        print(f"Warning: PE Excel export failed. CSV history was still saved. Error: {e}"); return csv_path, None
+        LOGGER.error("PE Excel export", e)
+        return csv_path, None
 
 
 def save_daily_reports(raw_df: pd.DataFrame, display_df: pd.DataFrame, pe_raw_df: pd.DataFrame, pe_display_df: pd.DataFrame, tickers: list[str], output_dir: str, as_of_date: str, generated_at: str) -> tuple[Path, Path, Path, Path]:
-    daily_dir = Path(output_dir) / as_of_date; daily_dir.mkdir(parents=True, exist_ok=True)
-    html_path, snap_path, pe_snap_path, latest_path = daily_dir / f"stock_report_{as_of_date}.html", daily_dir / f"stock_snapshot_{as_of_date}.csv", daily_dir / f"pe_valuation_snapshot_{as_of_date}.csv", Path(output_dir) / "latest.html"
-    raw_df.to_csv(snap_path, index=False); pe_raw_df.to_csv(pe_snap_path, index=False)
+    LOGGER.step("Saving daily HTML and CSV reports")
+    daily_dir = Path(output_dir) / as_of_date
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    html_path = daily_dir / f"stock_report_{as_of_date}.html"
+    snap_path = daily_dir / f"stock_snapshot_{as_of_date}.csv"
+    pe_snap_path = daily_dir / f"pe_valuation_snapshot_{as_of_date}.csv"
+    latest_path = Path(output_dir) / "latest.html"
+    raw_df.to_csv(snap_path, index=False)
+    pe_raw_df.to_csv(pe_snap_path, index=False)
     html_path.write_text(generate_html_report(raw_df, display_df, pe_raw_df, pe_display_df, tickers, as_of_date, generated_at), encoding="utf-8")
-    Path(output_dir).mkdir(parents=True, exist_ok=True); shutil.copyfile(html_path, latest_path)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(html_path, latest_path)
     return html_path, snap_path, pe_snap_path, latest_path
 
 
@@ -600,6 +770,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--as-of-date", default=None)
     p.add_argument("--no-excel", action="store_true")
     p.add_argument("--open-browser", action="store_true")
+    p.add_argument("--quiet", action="store_true", help="Reduce progress logs. Errors and warnings are still printed.")
     return p.parse_args()
 
 
@@ -612,24 +783,40 @@ def get_final_ticker_list(args: argparse.Namespace) -> list[str]:
 
 
 def main() -> None:
-    args = parse_args(); tickers = get_final_ticker_list(args)
+    global LOGGER
+    args = parse_args()
+    LOGGER = RunLogger(verbose=not args.quiet)
+    tickers = get_final_ticker_list(args)
     as_of_date = args.as_of_date or datetime.now().strftime("%Y-%m-%d")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    raw_df = build_report(tickers); display_df = format_for_display(raw_df)
-    pe_raw_df = build_pe_analysis(raw_df, as_of_date); pe_display_df = format_pe_analysis_for_display(pe_raw_df)
-    html_path, snap, pe_snap, latest = save_daily_reports(raw_df, display_df, pe_raw_df, pe_display_df, tickers, args.output_dir, as_of_date, generated_at)
-    hist_csv, hist_xlsx = save_history(raw_df, as_of_date, generated_at, args.data_dir, not args.no_excel)
-    pe_csv, pe_xlsx = save_pe_history(pe_raw_df, as_of_date, generated_at, args.data_dir, not args.no_excel)
-    print(f"Saved daily HTML report:   {html_path}")
-    print(f"Saved latest HTML copy:     {latest}")
-    print(f"Saved daily CSV snapshot:   {snap}")
-    print(f"Saved PE CSV snapshot:      {pe_snap}")
-    print(f"Updated history CSV:        {hist_csv}")
-    print(f"Updated history Excel:      {hist_xlsx if hist_xlsx else 'skipped or failed'}")
-    print(f"Updated PE history CSV:     {pe_csv}")
-    print(f"Updated PE history Excel:   {pe_xlsx if pe_xlsx else 'skipped or failed'}")
-    if args.open_browser:
-        webbrowser.open(html_path.resolve().as_uri())
+    try:
+        LOGGER.step(f"Starting stock report run. as_of_date={as_of_date}, tickers={', '.join(tickers)}")
+        raw_df = build_report(tickers)
+        display_df = format_for_display(raw_df)
+        pe_raw_df = build_pe_analysis(raw_df, as_of_date)
+        pe_display_df = format_pe_analysis_for_display(pe_raw_df)
+        html_path, snap, pe_snap, latest = save_daily_reports(raw_df, display_df, pe_raw_df, pe_display_df, tickers, args.output_dir, as_of_date, generated_at)
+        hist_csv, hist_xlsx = save_history(raw_df, as_of_date, generated_at, args.data_dir, not args.no_excel)
+        pe_csv, pe_xlsx = save_pe_history(pe_raw_df, as_of_date, generated_at, args.data_dir, not args.no_excel)
+        LOGGER.step("Output files")
+        print(f"Saved daily HTML report:   {html_path}")
+        print(f"Saved latest HTML copy:     {latest}")
+        print(f"Saved daily CSV snapshot:   {snap}")
+        print(f"Saved PE CSV snapshot:      {pe_snap}")
+        print(f"Updated history CSV:        {hist_csv}")
+        print(f"Updated history Excel:      {hist_xlsx if hist_xlsx else 'skipped or failed'}")
+        print(f"Updated PE history CSV:     {pe_csv}")
+        print(f"Updated PE history Excel:   {pe_xlsx if pe_xlsx else 'skipped or failed'}")
+        if args.open_browser:
+            LOGGER.step("Opening HTML report in default browser")
+            webbrowser.open(html_path.resolve().as_uri())
+    except Exception as e:
+        LOGGER.error("Fatal run failure", e)
+        if LOGGER.verbose:
+            traceback.print_exc()
+        sys.exit(1)
+    finally:
+        LOGGER.summary()
 
 
 if __name__ == "__main__":
