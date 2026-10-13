@@ -1,0 +1,10 @@
+Ticker,Company,Status,Method,Data Quality,Current Price,Current TTM EPS,Current TTM PE,Historical EPS Reports Used,PE_90D_Count,PE_90D_Min,PE_90D_Max,PE_90D_Mean,PE_90D_Median,PE_90D_Std,PE_90D_P10,PE_90D_P90,PE_90D_Current_ZScore,PE_90D_Current_Percentile,Value_90D_Min,Value_90D_Max,Value_90D_Mean,Value_90D_Lower_1Std,Value_90D_Upper_1Std,Value_90D_P10,Value_90D_P90,PE_180D_Count,PE_180D_Min,PE_180D_Max,PE_180D_Mean,PE_180D_Median,PE_180D_Std,PE_180D_P10,PE_180D_P90,PE_180D_Current_ZScore,PE_180D_Current_Percentile,Value_180D_Min,Value_180D_Max,Value_180D_Mean,Value_180D_Lower_1Std,Value_180D_Upper_1Std,Value_180D_P10,Value_180D_P90
+GOOG,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,348.9700012207031,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+MSFT,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,541.1500244140625,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+META,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,742.9600219726562,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+AMZN,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,259.5299987792969,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+AAPL,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,340.9700012207031,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+NVDA,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,226.32000732421875,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+AMD,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,594.239990234375,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+AVGO,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,354.7300109863281,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+NFLX,N/A,No positive current TTM EPS; PE analysis skipped,Skipped,No usable PE history,70.61000061035156,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
